@@ -1,0 +1,126 @@
+name: TaskFlow CI/CD
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  AWS_ACCOUNT_ID: "771549022759"
+
+jobs:
+  deploy:
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+      # 1. Download repository code
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+
+      # 2. Install Node
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+
+      # 3. Install backend dependencies
+      - name: Install backend dependencies
+        run: npm ci --prefix backend
+
+
+      # 4. Install frontend dependencies
+      - name: Install frontend dependencies
+        run: npm ci --prefix frontend
+
+
+      # 5. Check backend syntax
+      - name: Check backend
+        run: node --check backend/server.js
+
+
+      # 6. Build React
+      - name: Build frontend
+        run: npm run build --prefix frontend
+
+
+      # 7. Get temporary AWS credentials using OIDC
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+
+      # 8. Login Docker to ECR
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+
+      # 9. Build backend Docker image
+      - name: Build backend image
+        run: |
+          docker build \
+            -t $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/taskflow-backend:latest \
+            ./backend
+
+
+      # 10. Build frontend Docker image
+      - name: Build frontend image
+        run: |
+          docker build \
+            -t $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/taskflow-frontend:latest \
+            ./frontend
+
+
+      # 11. Push backend image
+      - name: Push backend image
+        run: |
+          docker push \
+            $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/taskflow-backend:latest
+
+
+      # 12. Push frontend image
+      - name: Push frontend image
+        run: |
+          docker push \
+            $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/taskflow-frontend:latest
+
+
+      # 13. Tell EC2 to deploy
+      - name: Deploy to EC2
+        env:
+          INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
+
+        run: |
+
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --parameters commands='["/home/ubuntu/deploy-taskflow.sh"]' \
+            --comment "Deploy TaskFlow" \
+            --query "Command.CommandId" \
+            --output text)
+
+          echo "SSM Command ID: $COMMAND_ID"
+
+          aws ssm wait command-executed \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$INSTANCE_ID"
+
+
+      # 14. Check the deployed application
+      - name: Verify deployment
+        run: |
+          curl --fail \
+            --retry 10 \
+            --retry-delay 5 \
+            "${{ secrets.APP_URL }}/api/tasks"
